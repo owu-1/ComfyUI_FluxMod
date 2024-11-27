@@ -1,149 +1,24 @@
-import math
-from dataclasses import dataclass
+from comfy.ldm.flux.math import attention
+from comfy.ldm.flux.layers import (
+    Modulation,
+    SelfAttention,
+    QKNorm,
+    RMSNorm,
+    MLPEmbedder
+)
 
 import torch
 from torch import Tensor, nn
 
-from .math import attention, rope
-import comfy.ops
-import comfy.ldm.common_dit
-
-
-class EmbedND(nn.Module):
-    def __init__(self, dim: int, theta: int, axes_dim: list):
-        super().__init__()
-        self.dim = dim
-        self.theta = theta
-        self.axes_dim = axes_dim
-
-    def forward(self, ids: Tensor) -> Tensor:
-        n_axes = ids.shape[-1]
-        emb = torch.cat(
-            [rope(ids[..., i], self.axes_dim[i], self.theta) for i in range(n_axes)],
-            dim=-3,
-        )
-
-        return emb.unsqueeze(1)
-
-
-class Approximator(nn.Module):
-    def __init__(self, in_dim: int, out_dim: int, hidden_dim: int, n_layers = 4):
-        super().__init__()
-        self.in_proj = nn.Linear(in_dim, hidden_dim, bias=True)
-        self.layers = nn.ModuleList([MLPEmbedder( hidden_dim, hidden_dim) for x in range( n_layers)])
-        self.norms = nn.ModuleList([RMSNorm( hidden_dim) for x in range( n_layers)])
-        self.out_proj = nn.Linear(hidden_dim, out_dim)
-
-    @property
-    def device(self):
-        # Get the device of the module (assumes all parameters are on the same device)
-        return next(self.parameters()).device
-    
-    def forward(self, x: Tensor) -> Tensor:
-        x = self.in_proj(x)
-
-        for layer, norms in zip(self.layers, self.norms):
-            x = x + layer(norms(x))
-
-        x = self.out_proj(x)
-
-        return x
-
-
-def timestep_embedding(t: Tensor, dim, max_period=10000, time_factor: float = 1000.0):
-    """
-    Create sinusoidal timestep embeddings.
-    :param t: a 1-D Tensor of N indices, one per batch element.
-                      These may be fractional.
-    :param dim: the dimension of the output.
-    :param max_period: controls the minimum frequency of the embeddings.
-    :return: an (N, D) Tensor of positional embeddings.
-    """
-    t = time_factor * t
-    half = dim // 2
-    freqs = torch.exp(-math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32, device=t.device) / half)
-
-    args = t[:, None].float() * freqs[None]
-    embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
-    if dim % 2:
-        embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
-    if torch.is_floating_point(t):
-        embedding = embedding.to(t)
-    return embedding
-
-class MLPEmbedder(nn.Module):
-    def __init__(self, in_dim: int, hidden_dim: int, dtype=None, device=None, operations=nn):
-        super().__init__()
-        self.in_layer = operations.Linear(in_dim, hidden_dim, bias=True, dtype=dtype, device=device)
-        self.silu = nn.SiLU()
-        self.out_layer = operations.Linear(hidden_dim, hidden_dim, bias=True, dtype=dtype, device=device)
-
-    def forward(self, x: Tensor) -> Tensor:
-        return self.out_layer(self.silu(self.in_layer(x)))
-
-
-class RMSNorm(torch.nn.Module):
-    def __init__(self, dim: int, dtype=None, device=None, operations=nn):
-        super().__init__()
-        self.scale = nn.Parameter(torch.empty((dim), dtype=dtype, device=device))
-
-    def forward(self, x: Tensor):
-        return comfy.ldm.common_dit.rms_norm(x, self.scale, 1e-6)
-
-
-class QKNorm(torch.nn.Module):
-    def __init__(self, dim: int, dtype=None, device=None, operations=nn):
-        super().__init__()
-        self.query_norm = RMSNorm(dim, dtype=dtype, device=device, operations=operations)
-        self.key_norm = RMSNorm(dim, dtype=dtype, device=device, operations=operations)
-
-    def forward(self, q: Tensor, k: Tensor, v: Tensor) -> tuple:
-        q = self.query_norm(q)
-        k = self.key_norm(k)
-        return q.to(v), k.to(v)
-
-
-class SelfAttention(nn.Module):
-    def __init__(self, dim: int, num_heads: int = 8, qkv_bias: bool = False, dtype=None, device=None, operations=nn):
-        super().__init__()
-        self.num_heads = num_heads
-        head_dim = dim // num_heads
-
-        self.qkv = operations.Linear(dim, dim * 3, bias=qkv_bias, dtype=dtype, device=device)
-        self.norm = QKNorm(head_dim, dtype=dtype, device=device, operations=operations)
-        self.proj = operations.Linear(dim, dim, dtype=dtype, device=device)
-
-
-@dataclass
-class ModulationOut:
-    shift: Tensor
-    scale: Tensor
-    gate: Tensor
-
-
-class Modulation(nn.Module):
-    def __init__(self, dim: int, double: bool, dtype=None, device=None, operations=nn):
-        super().__init__()
-        self.is_double = double
-        self.multiplier = 6 if double else 3
-        self.lin = operations.Linear(dim, self.multiplier * dim, bias=True, dtype=dtype, device=device)
-
-    def forward(self, vec: Tensor) -> tuple:
-        out = self.lin(nn.functional.silu(vec))[:, None, :].chunk(self.multiplier, dim=-1)
-
-        return (
-            ModulationOut(*out[:3]),
-            ModulationOut(*out[3:]) if self.is_double else None,
-        )
-
 
 class DoubleStreamBlock(nn.Module):
-    def __init__(self, hidden_size: int, num_heads: int, mlp_ratio: float, qkv_bias: bool = False, dtype=None, device=None, operations=nn):
+    def __init__(self, hidden_size: int, num_heads: int, mlp_ratio: float, qkv_bias: bool = False, dtype=None, device=None, operations=None):
         super().__init__()
 
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
         self.num_heads = num_heads
         self.hidden_size = hidden_size
+        self.img_mod = Modulation(hidden_size, double=True, dtype=dtype, device=device, operations=operations)
         self.img_norm1 = operations.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6, dtype=dtype, device=device)
         self.img_attn = SelfAttention(dim=hidden_size, num_heads=num_heads, qkv_bias=qkv_bias, dtype=dtype, device=device, operations=operations)
 
@@ -154,6 +29,7 @@ class DoubleStreamBlock(nn.Module):
             operations.Linear(mlp_hidden_dim, hidden_size, bias=True, dtype=dtype, device=device),
         )
 
+        self.txt_mod = Modulation(hidden_size, double=True, dtype=dtype, device=device, operations=operations)
         self.txt_norm1 = operations.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6, dtype=dtype, device=device)
         self.txt_attn = SelfAttention(dim=hidden_size, num_heads=num_heads, qkv_bias=qkv_bias, dtype=dtype, device=device, operations=operations)
 
@@ -164,8 +40,8 @@ class DoubleStreamBlock(nn.Module):
             operations.Linear(mlp_hidden_dim, hidden_size, bias=True, dtype=dtype, device=device),
         )
 
-    def forward(self, img: Tensor, txt: Tensor, pe: Tensor, distill_vec: Tensor=None):
-        (img_mod1, img_mod2), (txt_mod1, txt_mod2) = distill_vec
+    def forward(self, img: Tensor, txt: Tensor, vec: Tensor, pe: Tensor):
+        (img_mod1, img_mod2), (txt_mod1, txt_mod2) = vec
 
         # prepare image for attention
         img_modulated = self.img_norm1(img)
@@ -216,7 +92,7 @@ class SingleStreamBlock(nn.Module):
         qk_scale: float = None,
         dtype=None,
         device=None,
-        operations=nn
+        operations=None
     ):
         super().__init__()
         self.hidden_dim = hidden_size
@@ -236,9 +112,10 @@ class SingleStreamBlock(nn.Module):
         self.pre_norm = operations.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6, dtype=dtype, device=device)
 
         self.mlp_act = nn.GELU(approximate="tanh")
+        self.modulation = Modulation(hidden_size, double=False, dtype=dtype, device=device, operations=operations)
 
-    def forward(self, x: Tensor, pe: Tensor, distill_vec: Tensor=None) -> Tensor:
-        mod = distill_vec
+    def forward(self, x: Tensor, vec: Tensor, pe: Tensor) -> Tensor:
+        mod = vec
         x_mod = (1 + mod.scale) * self.pre_norm(x) + mod.shift
         qkv, mlp = torch.split(self.linear1(x_mod), [3 * self.hidden_size, self.mlp_hidden_dim], dim=-1)
 
@@ -256,15 +133,55 @@ class SingleStreamBlock(nn.Module):
 
 
 class LastLayer(nn.Module):
-    def __init__(self, hidden_size: int, patch_size: int, out_channels: int, dtype=None, device=None, operations=nn):
+    def __init__(self, hidden_size: int, patch_size: int, out_channels: int, dtype=None, device=None, operations=None):
         super().__init__()
         self.norm_final = operations.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6, dtype=dtype, device=device)
         self.linear = operations.Linear(hidden_size, patch_size * patch_size * out_channels, bias=True, dtype=dtype, device=device)
+        self.adaLN_modulation = nn.Sequential(nn.SiLU(), operations.Linear(hidden_size, 2 * hidden_size, bias=True, dtype=dtype, device=device))
 
-    def forward(self, x: Tensor, distill_vec: Tensor=None) -> Tensor:
-        shift, scale = distill_vec
+    def forward(self, x: Tensor, vec: Tensor) -> Tensor:
+        shift, scale = vec
         shift = shift.squeeze(1)
         scale = scale.squeeze(1)
         x = (1 + scale[:, None, :]) * self.norm_final(x) + shift[:, None, :]
         x = self.linear(x)
+        return x
+
+
+class Approximator(nn.Module):
+    def __init__(self, in_dim: int, out_dim: int, hidden_dim: int, n_layers=4, dtype=None, device=None, operations=None):
+        super().__init__()
+        self.in_proj = operations.Linear(in_dim, hidden_dim, bias=True, dtype=dtype, device=device)
+
+        self.layers = nn.ModuleList(
+            [
+                MLPEmbedder(
+                    in_dim=hidden_dim,
+                    hidden_dim=hidden_dim,
+                    dtype=dtype, device=device, operations=operations
+                )
+                for _ in range(n_layers)
+            ]
+        )
+
+        self.norms = nn.ModuleList(
+            [
+                RMSNorm(
+                    hidden_dim,
+                    dtype=dtype, device=device, operations=operations
+                )
+                for _ in range(n_layers)
+            ]
+        )
+
+        self.out_proj = operations.Linear(hidden_dim, out_dim, dtype=dtype, device=device)
+
+    def forward(self, x: Tensor) -> Tensor:
+        x = self.in_proj(x)
+
+        for layer, norms in zip(self.layers, self.norms):
+            x = x + layer(norms(x))
+
+        x = self.out_proj(x)
+
         return x
