@@ -96,7 +96,7 @@ class Flux(nn.Module):
         distill_timestep = timestep_embedding(timesteps, 16).to(img.dtype)
         distil_guidance = timestep_embedding(guidance, 16).to(img.dtype)
         # get all modulation index
-        modulation_index = timestep_embedding(torch.arange(0, self.mod_index_length), 32).unsqueeze(0).to(dtype=img.dtype, device=img.device)
+        modulation_index = timestep_embedding(torch.arange(0, self.mod_index_length).to(device=img.device), 32).unsqueeze(0).to(dtype=img.dtype)
         # broadcast timestep and guidance
         timestep_guidance = torch.cat((distill_timestep, distil_guidance), dim=1).unsqueeze(1).expand(1, self.mod_index_length, 32)
         input_vec = torch.cat((timestep_guidance, modulation_index), dim=-1)
